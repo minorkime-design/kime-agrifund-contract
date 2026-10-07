@@ -1,0 +1,16 @@
+{
+  "name": "minor-kime-agrifund-contracts",
+  "version": "0.1.0",
+  "description": "Minor Kime AgriFund — Soroban smart contracts on Stellar",
+  "type": "module",
+  "scripts": {
+    "deploy": "node scripts/deploy-and-integrate.mjs"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "^13.3.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

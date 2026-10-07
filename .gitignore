@@ -1,0 +1,13 @@
+target/
+node_modules/
+
+# Secret / generated env files
+addresses.env
+.env
+.env.*
+!.env.example
+!addresses.env.example
+
+# Compiled WASM backups
+*.wasm.bak
+

@@ -1,0 +1,200 @@
+name: Soroban CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 3
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── 1. Test all contracts ──────────────────────────────────────────────────
+  test:
+    name: Test (${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust:
+          - stable
+          - 1.78.0   # MSRV — minimum supported Rust version
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust ${{ matrix.rust }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Cache Cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-test-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-${{ matrix.rust }}-
+            ${{ runner.os }}-cargo-test-
+
+      - name: Run all tests
+        run: cargo test --verbose --all
+
+  # ── 2. Build WASM artifacts ───────────────────────────────────────────────
+  build-wasm:
+    name: Build WASM
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-wasm-
+
+      - name: Build all contracts (release + wasm32)
+        run: cargo build --release --target wasm32-unknown-unknown
+
+      - name: Install binaryen (wasm-opt)
+        run: |
+          BINARYEN_VER=117
+          curl -fsSL \
+            "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VER}/binaryen-version_${BINARYEN_VER}-x86_64-linux.tar.gz" \
+            | tar -xz --strip-components=2 -C /usr/local/bin \
+              "binaryen-version_${BINARYEN_VER}/bin/wasm-opt"
+          wasm-opt --version
+
+      - name: Optimise WASM with wasm-opt -Oz
+        run: |
+          WASM_DIR="target/wasm32-unknown-unknown/release"
+          echo "───────────────────────────────────────────────────"
+          printf "%-40s %10s %10s %8s\n" "Contract" "Before" "After" "Saving"
+          echo "───────────────────────────────────────────────────"
+          for wasm in "$WASM_DIR"/*.wasm; do
+            [[ "$wasm" == *test* || "$wasm" == *deps* ]] && continue
+            [ -f "$wasm" ] || continue
+            before=$(wc -c < "$wasm")
+            wasm-opt -Oz --strip-debug --strip-producers "$wasm" -o "$wasm"
+            after=$(wc -c < "$wasm")
+            pct=$(( (before - after) * 100 / before ))
+            printf "%-40s %10s %10s %7s%%\n" \
+              "$(basename "$wasm")" "${before}B" "${after}B" "$pct"
+          done
+          echo "───────────────────────────────────────────────────"
+
+      - name: Check WASM size limit (≤ 15 KB per contract)
+        run: |
+          LIMIT=15360
+          FAILED=()
+          for wasm in target/wasm32-unknown-unknown/release/*.wasm; do
+            [[ "$wasm" == *test* || "$wasm" == *deps* ]] && continue
+            [ -f "$wasm" ] || continue
+            size=$(wc -c < "$wasm")
+            if [ "$size" -gt "$LIMIT" ]; then
+              kb=$(echo "scale=1; $size / 1024" | bc)
+              FAILED+=("$(basename "$wasm") (${kb} KB)")
+            fi
+          done
+          if [ ${#FAILED[@]} -gt 0 ]; then
+            echo "❌ Contracts exceeding 15 KB limit:"
+            for item in "${FAILED[@]}"; do echo "   • $item"; done
+            exit 1
+          fi
+          echo "✅ All contracts within the 15 KB size limit."
+
+      - name: Upload WASM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-contracts
+          path: target/wasm32-unknown-unknown/release/*.wasm
+          retention-days: 30
+
+  # ── 3. Lint (Clippy) ──────────────────────────────────────────────────────
+  lint:
+    name: Clippy lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-lint-
+
+      - name: Clippy (wasm32 target, deny warnings)
+        run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+
+  # ── 4. Formatting ─────────────────────────────────────────────────────────
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable + rustfmt
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # ── 5. Security audit ─────────────────────────────────────────────────────
+  audit:
+    name: Cargo audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Run security audit
+        run: cargo audit

@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# Minor Kime AgriFund — Soroban Contract Deployment Pipeline (Dockerized)
+#
+# This script automates the compilation, deployment, and integration of
+# Soroban smart contracts using Docker containers to ensure consistency.
+#
+# Prerequisites:
+#   - Docker installed and running
+#   - DEPLOYER_SECRET env var set (Stellar secret key with XLM)
+#   - USDC_CONTRACT_ID env var set (USDC token contract ID)
+#
+# Usage:
+#   DEPLOYER_SECRET=S... USDC_CONTRACT_ID=C... ./scripts/deploy.sh
+#
+# Optional:
+#   NETWORK=testnet|mainnet (default: testnet)
+#   PLATFORM_FEE_BPS=200    (default: 200 = 2%)
+#   OUTPUT_ENV=./addresses.env  path to write deployed contract IDs
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+NETWORK="${NETWORK:-testnet}"
+RPC_URL="${SOROBAN_RPC_URL:-https://soroban-testnet.stellar.org}"
+NETWORK_PASSPHRASE="${NETWORK_PASSPHRASE:-Test SDF Network ; September 2015}"
+PLATFORM_FEE_BPS="${PLATFORM_FEE_BPS:-200}"
+
+DEPLOYER_SECRET="${DEPLOYER_SECRET:?DEPLOYER_SECRET environment variable is required}"
+USDC_CONTRACT_ID="${USDC_CONTRACT_ID:?USDC_CONTRACT_ID environment variable is required}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# This is a standalone contracts repo — ROOT_DIR is the repo root itself
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+BLOCKCHAIN_DIR="$ROOT_DIR"
+# Contract IDs are written to addresses.env in the repo root by default
+OUTPUT_ENV="${OUTPUT_ENV:-$ROOT_DIR/addresses.env}"
+
+# Docker Images
+RUST_IMAGE="rust:1.76-slim-bookworm"
+STELLAR_CLI_IMAGE="stellar/stellar-cli:latest"
+
+echo "🚀 Starting AgriFi Deployment Pipeline ($NETWORK)"
+
+# ── 1. Compilation + WASM optimisation ───────────────────────────────────────
+echo "📦 Step 1: Compiling contracts and optimising WASM inside Docker..."
+docker run --rm \
+  -v "$BLOCKCHAIN_DIR":/workspace \
+  -w /workspace \
+  "$RUST_IMAGE" \
+  bash -c "
+    set -euo pipefail
+    apt-get update -qq && apt-get install -y --no-install-recommends clang curl xz-utils
+
+    # Install binaryen (wasm-opt) — use a pre-built release for speed
+    BINARYEN_VER=117
+    curl -fsSL https://github.com/WebAssembly/binaryen/releases/download/version_\${BINARYEN_VER}/binaryen-version_\${BINARYEN_VER}-x86_64-linux.tar.gz \
+      | tar -xz --strip-components=2 -C /usr/local/bin binaryen-version_\${BINARYEN_VER}/bin/wasm-opt
+
+    rustup target add wasm32-unknown-unknown
+
+    # Compile with workspace release profile (opt-level=z, lto, codegen-units=1, panic=abort)
+    cargo build --target wasm32-unknown-unknown --release
+
+    # Post-process each WASM with wasm-opt -Oz for further binary size reduction
+    WASM_DIR=target/wasm32-unknown-unknown/release
+    for wasm in \${WASM_DIR}/*.wasm; do
+      [ -f \"\${wasm}\" ] || continue
+      original_size=\$(wc -c < \"\${wasm}\")
+      wasm-opt -Oz --strip-debug --strip-producers \"\${wasm}\" -o \"\${wasm}\"
+      optimised_size=\$(wc -c < \"\${wasm}\")
+      echo \"  ✅ \$(basename \"\${wasm}\"): \${original_size} → \${optimised_size} bytes\"
+    done
+  "
+
+WASM_DIR="$BLOCKCHAIN_DIR/target/wasm32-unknown-unknown/release"
+
+# ── Helper: Docker Stellar CLI ───────────────────────────────────────────────
+stellar_run() {
+  docker run --rm \
+    -v "$BLOCKCHAIN_DIR":/workspace \
+    -w /workspace \
+    -e STELLAR_NETWORK="$NETWORK" \
+    -e STELLAR_RPC_URL="$RPC_URL" \
+    -e STELLAR_NETWORK_PASSPHRASE="$NETWORK_PASSPHRASE" \
+    "$STELLAR_CLI_IMAGE" "$@"
+}
+
+# ── Helper: Deploy + Capture ID ──────────────────────────────────────────────
+deploy_wasm() {
+  local name="$1"
+  local wasm_path="target/wasm32-unknown-unknown/release/$2"
+  echo "  🚀 Deploying $name..."
+  
+  # Deploy contract and capture the ID (Stellar IDs start with 'C' and are 56 chars)
+  local output
+  output=$(stellar_run contract deploy \
+    --wasm "$wasm_path" \
+    --source "$DEPLOYER_SECRET" \
+    --network "$NETWORK" 2>&1)
+  
+  local contract_id
+  contract_id=$(echo "$output" | grep -oE "C[A-Z0-9]{55}" | head -n 1)
+  
+  if [ -z "$contract_id" ]; then
+    echo "❌ Failed to deploy $name. Output:"
+    echo "$output"
+    exit 1
+  fi
+  
+  echo "$contract_id"
+}
+
+# ── 2. Deployment ─────────────────────────────────────────────────────────────
+echo "🌐 Step 2: Uploading WASM and instantiating contracts..."
+
+ADMIN_ADDRESS=$(stellar_run keys address "$DEPLOYER_SECRET")
+
+# ProjectFactory
+FACTORY_ID=$(deploy_wasm "ProjectFactory" "project_factory.wasm")
+echo "     ✅ ProjectFactory: $FACTORY_ID"
+
+echo "     Initialize ProjectFactory..."
+stellar_run contract invoke \
+  --id "$FACTORY_ID" \
+  --source "$DEPLOYER_SECRET" \
+  --network "$NETWORK" \
+  -- initialize --admin "$ADMIN_ADDRESS"
+
+# MarketplaceSettlement
+SETTLEMENT_ID=$(deploy_wasm "MarketplaceSettlement" "marketplace_settlement.wasm")
+echo "     ✅ MarketplaceSettlement: $SETTLEMENT_ID"
+
+echo "     Initialize MarketplaceSettlement..."
+stellar_run contract invoke \
+  --id "$SETTLEMENT_ID" \
+  --source "$DEPLOYER_SECRET" \
+  --network "$NETWORK" \
+  -- initialize \
+  --admin "$ADMIN_ADDRESS" \
+  --usdc_token "$USDC_CONTRACT_ID" \
+  --platform_fee_bps "$PLATFORM_FEE_BPS"
+
+# RevenueDistributor
+DISTRIBUTOR_ID=$(deploy_wasm "RevenueDistributor" "revenue_distributor.wasm")
+echo "     ✅ RevenueDistributor: $DISTRIBUTOR_ID"
+
+echo "     Initialize RevenueDistributor..."
+stellar_run contract invoke \
+  --id "$DISTRIBUTOR_ID" \
+  --source "$DEPLOYER_SECRET" \
+  --network "$NETWORK" \
+  -- initialize \
+  --admin "$ADMIN_ADDRESS" \
+  --usdc_token "$USDC_CONTRACT_ID"
+
+# ── 3. Write contract IDs ─────────────────────────────────────────────────────
+echo "💾 Step 3: Writing contract IDs to $OUTPUT_ENV ..."
+
+update_env() {
+  local key="$1"
+  local value="$2"
+  if grep -q "^$key=" "$OUTPUT_ENV" 2>/dev/null; then
+    sed -i "s|^$key=.*|$key=$value|" "$OUTPUT_ENV"
+  else
+    echo "$key=$value" >> "$OUTPUT_ENV"
+  fi
+}
+
+touch "$OUTPUT_ENV"
+
+update_env "SOROBAN_RPC_URL" "$RPC_URL"
+update_env "SOROBAN_FACTORY_CONTRACT_ID" "$FACTORY_ID"
+update_env "SOROBAN_SETTLEMENT_CONTRACT_ID" "$SETTLEMENT_ID"
+update_env "SOROBAN_DISTRIBUTOR_CONTRACT_ID" "$DISTRIBUTOR_ID"
+update_env "USDC_CONTRACT_ID" "$USDC_CONTRACT_ID"
+
+echo ""
+echo "🎉 Deployment Successful!"
+echo "----------------------------------------"
+echo "Network:               $NETWORK"
+echo "ProjectFactory:        $FACTORY_ID"
+echo "MarketplaceSettlement: $SETTLEMENT_ID"
+echo "RevenueDistributor:    $DISTRIBUTOR_ID"
+echo "USDC:                  $USDC_CONTRACT_ID"
+echo "----------------------------------------"
+echo "Contract IDs written to: $OUTPUT_ENV"
+echo ""
+echo "To integrate with a backend, copy the values from $OUTPUT_ENV"
+echo "into your application's environment configuration."
